@@ -5,6 +5,9 @@ import 'package:image_picker/image_picker.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:flutter/services.dart';
+import 'package:http/http.dart' as http;
+import 'dart:convert';
+import 'result_screen.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -77,50 +80,142 @@ class _MicroplasticDetectionScreenState
     }
   }
 
-  // Capture image using camera
   Future<void> _captureImage() async {
-    if (_cameraController == null || !_cameraController!.value.isInitialized) {
-      return;
-    }
+  if (_cameraController == null || !_cameraController!.value.isInitialized) {
+    return;
+  }
 
-    final XFile file = await _cameraController!.takePicture();
+  // Reset previous image and result
+  setState(() {
+    _image = null;
+    _result = "No analysis yet";
+  });
+
+  final XFile file = await _cameraController!.takePicture();
+
+  setState(() {
+    _image = File(file.path);
+  });
+
+  await _runInference(); // Process new image
+}
+
+
+
+
+  Future<void> _pickImage() async {
+  setState(() {
+    _image = null;
+    _result = "No analysis yet";
+  });
+
+  final pickedFile = await ImagePicker().pickImage(source: ImageSource.gallery);
+
+  if (pickedFile != null) {
     setState(() {
-      _image = File(file.path);
+      _image = File(pickedFile.path);
     });
 
-    _runInference();
+    await _runInference(); // Process new image
   }
+}
 
-  // Pick image from gallery
-  Future<void> _pickImage() async {
-    final pickedFile =
-        await ImagePicker().pickImage(source: ImageSource.gallery);
+Future<double> _getMicroplasticAmount(File image) async {
+  var request = http.MultipartRequest(
+    'POST',
+    Uri.parse('https://abhinpt2002-marineml.hf.space/predict_percentage/'),
+  );
+  request.files.add(await http.MultipartFile.fromPath('file', image.path));
 
-    if (pickedFile != null) {
-      setState(() {
-        _image = File(pickedFile.path);
-      });
-      _runInference();
+  try {
+    var response = await request.send();
+    if (response.statusCode == 200) {
+      var responseData = await response.stream.bytesToString();
+      var jsonResponse = jsonDecode(responseData);
+      return jsonResponse['foreground_percentage']; // Assuming API returns a JSON with "microplastic_amount"
+    } else {
+      print("Error in microplastic API: ${response.statusCode}");
+      return -1; // Indicating failure
     }
+  } catch (e) {
+    print("API Error: $e");
+    return -1;
   }
+}
 
-  // Run inference on the image
+
+
+
   Future<void> _runInference() async {
-    if (_image == null || _interpreter == null) return;
+  if (_image == null) return;
 
-    try {
-      var input = await _preprocessImage(_image!);
-      var output = List.filled(1, 0).reshape([1, 1]);
+  setState(() {
+    _result = "Processing...";
+  });
 
-      _interpreter!.run(input, output);
+  var segmentationRequest = http.MultipartRequest(
+    'POST',
+    Uri.parse('https://abhinpt2002-marineml.hf.space/predict_mask/'),
+  );
+  segmentationRequest.files.add(await http.MultipartFile.fromPath('file', _image!.path));
 
+  try {
+    var segmentationResponse = await segmentationRequest.send();
+
+    if (segmentationResponse.statusCode == 200) {
+      Uint8List bytes = await segmentationResponse.stream.toBytes();
+
+      final directory = await getApplicationDocumentsDirectory();
+      final filePath = '${directory.path}/output_${DateTime.now().millisecondsSinceEpoch}.png';
+      File outputFile = File(filePath);
+      await outputFile.writeAsBytes(bytes);
+
+      print("Saved output image at: $filePath");
+
+      // Call second API for microplastic analysis
+      double microplasticAmount = await _getMicroplasticAmount(outputFile);
+
+      // Ensure UI updates before navigation
       setState(() {
-        _result = "Detection Result: ${output[0][0] > 0.5 ? "Microplastics Detected" : "No Microplastics"}";
+        _image = outputFile;
+        _result = "Detection Completed";
       });
-    } catch (e) {
-      print("Error running inference: $e");
+
+      // Navigate to ResultScreen, passing the microplastic amount
+      Future.delayed(Duration(milliseconds: 300), () {
+        Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder: (context) => ResultScreen(
+              image: outputFile,
+              result: "Detection Completed",
+              microplasticAmount: microplasticAmount, // ✅ Pass this value correctly
+            ),
+          ),
+        );
+      });
+    } else {
+      print("Error: ${segmentationResponse.statusCode}");
+      setState(() {
+        _result = "API Error: ${segmentationResponse.statusCode}";
+      });
     }
+  } catch (e) {
+    print("API Error: $e");
+    setState(() {
+      _result = "Request Failed";
+    });
   }
+}
+
+
+
+
+
+
+
+
+
 
   // Placeholder for Image Preprocessing
   Future<List<List<List<List<double>>>>> _preprocessImage(File image) async {
